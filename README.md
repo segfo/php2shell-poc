@@ -42,10 +42,10 @@ Impacts **78% of all websites** — including WordPress (43%), Joomla, Drupal, L
 | **A** | Session injection + LFI | Yes | App has any LFI sink | All |
 | **B** | var_destroy UAF → handler overwrite | No | App calls `unserialize()` | All |
 | **C** | Handler mismatch → `__destruct` | Yes | Two dirs with different serialize_handler | FPM |
-| **D** | OOM corruption → stale `EG()` | Yes | **None** — any endpoint | mod_php |
+| **D** | OOM in rfc1867 → resource leak | DoS only* | **None** — any endpoint | mod_php |
 | **E** | FPM session OOM → stale `BG()` | Yes | Any `session_start()` endpoint | FPM |
 
-Chain D is the most critical: **zero-dependency pre-auth RCE** against any Apache mod_php installation. No LFI, no app vulnerability, no authentication — just a single multipart POST.
+**\*Chain D note:** Independent verification ([details](docs/CHAIN_D_ANALYSIS.md)) found that pure Chain D achieves **DoS only** on stock PHP builds — not RCE. OOM fires during `sapi_activate()` before RINIT, so `EG(objects_store)` is empty (no user objects to UAF). Hash tables remain consistent after `longjmp()`, session data serializes without corruption, and ZMM cleanup prevents exploitable state. RCE requires combining D with Chain A (LFI) or Chain C (handler mismatch). The "stale EG()" mechanism described in the original writeup was not reproducible.
 
 ## Exploits
 
@@ -57,7 +57,7 @@ Three RCE exploits (Chains A, B, C) are included in [`exploit/`](exploit/):
 | `chain_b_uaf_rce.php` | B | var_destroy UAF → discovers `zif_system` via EG() → overwrites `var_dump` handler via `/proc/self/mem` → RCE |
 | `chain_c_mismatch_rce.py` | C | Pollutes FPM worker `PS(serializer)` → injects serialized object via filename → `__destruct` fires on decode failure → RCE |
 
-Chains D and E exploits are available to [paid subscribers](https://qideng.substack.com/p/php2shell-dissecting-phps-critical).
+Chain E exploit is available to [paid subscribers](https://qideng.substack.com/p/php2shell-dissecting-phps-critical). Chain D (OOM) achieves DoS only on stock builds — see [analysis](docs/CHAIN_D_ANALYSIS.md).
 
 ```bash
 # Chain A: Session injection + LFI → RCE
@@ -126,6 +126,7 @@ php2shell-poc/
 │   └── php.ini / php-apache.ini      # Vulnerable PHP configs
 └── docs/
     ├── ANALYSIS.md                   # Full technical analysis
+    ├── CHAIN_D_ANALYSIS.md           # Chain D verification: DoS only, not RCE
     └── substack_article.md           # Writeup source
 ```
 
@@ -137,7 +138,7 @@ session.upload_progress.enabled = Off
 session.use_only_cookies = On
 ```
 
-> **The only complete fix is patching PHP** to 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12+. The OOM corruption (Chain D) is in the Zend engine core — no INI setting fixes it.
+> **The only complete fix is patching PHP** to 8.2.35 / 8.3.36 / 8.4.27 / 8.5.12+. The OOM resource leak (Chain D) is in the Zend engine core — no INI setting fixes it. Note: Chain D impact on stock builds is DoS, not RCE.
 
 ## Downstream Impact
 
@@ -164,7 +165,7 @@ Wiz has demonstrated pre-auth RCE on stock container images:
 
 ## Disclaimer
 
-This repository is for **authorized security testing and educational purposes only**. Exploit code for Chains D and E (zero-dependency RCE) is available to [paid subscribers](https://qideng.substack.com/p/php2shell-dissecting-phps-critical) of the writeup.
+This repository is for **authorized security testing and educational purposes only**. Chain D was independently verified to be DoS-only on stock builds ([analysis](docs/CHAIN_D_ANALYSIS.md)). Chain E exploit is available to [paid subscribers](https://qideng.substack.com/p/php2shell-dissecting-phps-critical).
 
 ## License
 
