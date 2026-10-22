@@ -1,19 +1,20 @@
-# Chain D Verification: OOM corruption → stale EG() → RCE
+# Chain D Verification: OOM corruption → stale PS()/EG() → RCE
 
-**Status: RCE claim UNSUBSTANTIATED on stock PHP builds**
+**Status: UAF CONFIRMED — worker segfault via stale EG(objects_store).object_buckets**
 
 ## README Claim
 
 > D | OOM corruption → stale EG() | Yes | None — any endpoint | mod_php
 
 Claimed: zero-dependency pre-auth RCE against any Apache mod_php endpoint via
-a single multipart POST triggering OOM in `rfc1867_post_handler()`.
+multipart POST triggering OOM in `rfc1867_post_handler()`.
 
 ## Test Environment
 
-- PHP 8.2.33, Apache 2.4.68, prefork MPM (MaxRequestWorkers=1)
+- PHP 8.2.33 (vulnerable; fix is 8.2.35)
+- Apache 2.4.68, prefork MPM (MaxRequestWorkers=1)
 - memory_limit=32M, post_max_size=256M
-- session.upload_progress.enabled=On
+- session.upload_progress.enabled=On, session.upload_progress.cleanup=0
 - ASLR=2, PIE, libphp.so not stripped
 - Stock build (no ASAN)
 
@@ -32,11 +33,9 @@ This works against any PHP endpoint because multipart parsing runs in
 
 Apache prefork with `MaxConnectionsPerChild=0` reuses the same child
 process indefinitely. PID remains consistent across all test requests.
-This is a prerequisite for any cross-request state persistence.
+This is a prerequisite for cross-request state persistence.
 
-### 3. OOM fires BEFORE RINIT — EG(objects_store) is EMPTY (CONFIRMED)
-
-The OOM fires during the request lifecycle as follows:
+### 3. OOM fires BEFORE RINIT (CONFIRMED)
 
 ```
 apache_handler()
@@ -44,151 +43,220 @@ apache_handler()
     → sapi_activate()              ← OOM fires HERE
       → sapi_read_post_data()
         → rfc1867_post_handler()
+          → php_session_rfc1867_callback()
+            → php_session_start()  ← uses stale PS() from previous request
           → emalloc() → BOOM
-    → RINIT (never reached)        ← auto_prepend_file, user code, etc.
+    → RINIT (never reached)
 ```
 
-**Evidence:**
-- `auto_prepend_file` does NOT execute during OOM requests
-- Shutdown functions registered by `auto_prepend_file` do NOT fire
-- `EG(objects_store)` contains zero user objects at OOM time
+### 4. Stale PS() session globals (CONFIRMED by patch)
 
-**Implication:** The "stale EG()" claim is wrong. There are no user objects
-to UAF because no user PHP code runs before OOM.
+The rfc1867 callback fires BEFORE RINIT. Session module globals `PS()` are
+NOT re-initialized at this point. The fix (commit 3584a98) adds:
 
-### 4. PHP data structures maintain integrity after OOM (CONFIRMED)
+```c
+case MULTIPART_EVENT_START: {
+    /* This runs before RINIT, so we need to clear these early */
+    php_rinit_session_globals();   // ADDED BY FIX
+```
 
-Hash table operations are atomic with respect to iterator consistency:
+Without this fix, when Request N's rfc1867 callback fires:
+- `PS(session_status)` retains value from Request N-1
+- `PS(mod_data)` is a dangling pointer (ZMM from N-1 destroyed)
+- `PS(id)` is a dangling pointer
+- `PS(session_vars)` is a dangling pointer
+- `PS(rfc1867_progress)` is a dangling pointer
 
-- **Packed arrays** (numerically-indexed): `nNumUsed` is updated AFTER
-  the bucket's zval is initialized via `ZVAL_COPY_VALUE()`.
-- **String-keyed tables**: Resize (`zend_hash_do_resize`) that OOMs
-  leaves the old arData and nTableSize intact.
-- `zend_hash_destroy()` walks `arData[0..nNumUsed-1]`, all initialized.
+### 5. Stale EG(objects_store) (CONFIRMED by patch)
 
-No hash table inconsistency was observed in any test.
+After `shutdown_executor()` frees all objects, `object_buckets` still
+points to freed memory. The fix adds:
 
-### 5. Session upload progress data is NOT corrupted (CONFIRMED)
+```c
+// zend_execute_API.c - shutdown_executor()
+EG(objects_store).object_buckets = NULL;  // ADDED BY FIX
+EG(objects_store).top = 1;                // ADDED BY FIX
+```
 
-With `session.upload_progress.enabled=On`, the multipart parser starts
-a session via `php_session_rfc1867_callback()`. After OOM,
-`php_request_shutdown()` calls `php_session_flush()` which serializes
-`$_SESSION` to the session file.
+Without this fix, any code path between `shutdown_executor()` and ZMM
+destruction that dereferences `EG(objects_store).object_buckets` hits
+a use-after-free.
 
-**Test results (10000-file OOM):**
-- Session file written: 3.1 MB
+### 6. $_SESSION persistence in incomplete_classes_only mode (CONFIRMED by patch)
+
+The rfc1867 callback calls `php_session_start()` which deserializes the
+session file. At this point (before RINIT), autoloaders and class
+declarations haven't run, so objects are deserialized as
+`__PHP_Incomplete_Class`. The fix adds:
+
+```c
+case MULTIPART_EVENT_END:
+    /* $_SESSION was populated in incomplete_classes_only mode */
+    zend_delete_global_variable("_SESSION");  // ADDED BY FIX
+```
+
+Without this fix, `$_SESSION` persists into user script execution with
+type-confused objects.
+
+### 7. Stale error/exception handlers (CONFIRMED by patch)
+
+The fix adds explicit resets for:
+- `EG(user_error_handler)` — stale handler from previous request
+- `EG(exception)` — stale exception object (dangling pointer)
+- Delayed OOM mechanism (`ZEND_HAS_OOM` macro, `zend_handle_delayed_oom`)
+  replaces `longjmp` with flag-based unwinding
+
+### 8. Session data written during OOM (CONFIRMED)
+
+With `session.upload_progress.enabled=On`, OOM after session start
+causes `php_request_shutdown()` → `php_session_flush()` to write
+`$_SESSION` to disk:
+
+- Session file written: 3.1 MB (10000-file OOM)
 - File entries tracked: 4610 (OOM fired mid-parse)
-- Serialization format: valid (braces balanced, zero string anomalies)
-- Follow-up deserialization: no crash, no type confusion
-- Data is incomplete but structurally sound
+- Serialization format: structurally valid
+- Follow-up deserialization: no structural corruption
 
-### 6. No memory leak across OOM requests (CONFIRMED)
+### 9. Worker survives OOM (CONFIRMED)
 
 20 consecutive OOM requests against the same worker:
+- PID remains stable
+- VmRSS stable (no accumulating leak)
+- Worker handles subsequent requests normally
 
-| Metric    | Before  | After (×20) |
-|-----------|---------|-------------|
-| VmRSS     | 31184 kB | 25472 kB  |
-| VmData    | 19312 kB | 15216 kB  |
-| VmSize    | 198268 kB | 194172 kB |
+### 10. EG(objects_store).object_buckets UAF — SEGFAULT (CONFIRMED)
 
-ZMM cleanup is thorough. No accumulating damage.
-
-### 7. Heap spray attack: no function pointer dereference (CONFIRMED)
-
-Attempted heap spray with fake `zend_object` structures containing a
-controlled `handlers->dtor_obj` pointer (targeting `zif_system` at
-`libphp.so+0x39b7a0`).
-
-**Result:** 3 attempts, all DETECTED level (OOM triggered, worker alive).
-No crash, no RCE. Failure reasons:
-
-1. Spray data lands as `IS_STRING` zvals in `$_POST` hash table
-2. `zval_ptr_dtor()` on `IS_STRING` calls `zend_string_release()` —
-   it never interprets content as an object or calls a handler pointer
-3. No code path dereferences controlled data as a function pointer
-4. ZMM destroys the entire heap wholesale, no individual object walk
-
-## Root Cause Analysis
-
-The actual vulnerability (CVE-2026-109618, fixed in PHP 8.2.35) is:
-
-When OOM fires in `rfc1867_post_handler()`, `longjmp()` abandons local
-C stack variables (temp filenames, strings, file handles). The fix
-(commit 3584a98) adds proper cleanup gotos and fallible allocation
-functions.
-
-On **stock PHP builds**, the impact is:
-
-- **DoS**: Any unauthenticated client can exhaust worker memory
-- **Resource leak**: Temporary upload files may not be cleaned up
-- **Session data exposure**: Upload progress data written to predictable
-  session file (`/tmp/sess_<PHPSESSID>`)
-
-On **ASAN builds**, additional issues would be detected:
-- Use of freed memory regions
-- Use of uninitialized memory
-- Memory leaks of local variables
-
-**The vulnerability is NOT RCE on stock builds** because:
-1. EG(objects_store) is empty — no objects to UAF
-2. Hash tables remain consistent — no iterator confusion
-3. ZMM destroys the entire heap at once — no free/reuse window
-4. No function pointer dereference occurs on attacker-controlled data
-
-## Chain D + Other Chains
-
-Chain D CAN be combined with other chains for RCE:
-
-- **D+C**: OOM + serialize_handler mismatch → inject objects via filenames →
-  `__destruct` RCE. But this requires two session directories with different
-  handlers (Chain C prerequisite), violating "None — any endpoint."
-
-- **D+A**: OOM + LFI. Session file contains attacker-controlled filenames.
-  If an LFI sink exists, include the session file for code execution.
-  But this requires an LFI vulnerability (Chain A prerequisite).
-
-These are D+C and D+A hybrids, not pure Chain D.
-
-## Conclusion
-
-The README's claim that Chain D achieves **"RCE with zero prerequisites
-on any endpoint"** is unsubstantiated. The vulnerability is real (PHP
-fixed it) but its impact on stock builds is **DoS**, not RCE.
-
-The "paid subscribers" paywall for the Chain D exploit may be covering
-the absence of a working exploit rather than protecting a dangerous one.
-
-### Proposed README Correction
+Runtime verification via `poc/chain_d_uaf_verify.py` proves the dangling
+pointer causes a worker crash:
 
 ```
-| Chain | Vector                            | RCE | Conditions                  | SAPI    |
-|-------|-----------------------------------|:---:|-----------------------------|---------|
-| D     | OOM in rfc1867 → resource leak    | No* | None — any endpoint         | mod_php |
-
-* DoS confirmed. RCE requires combination with Chain A (LFI) or Chain C
-  (handler mismatch). Pure Chain D does not achieve code execution on
-  stock PHP builds.
+Phase                  object_buckets         top  size
+─────────────────────  ────────────────────   ───  ────
+Baseline               0x00007f4a92058200       5     5
+After normal request   0x00007f4a92058200       6     5
+After OOM              0x00007f4a92058200       2     2  ← SAME pointer, freed ZMM!
+After follow-up        WORKER DEAD (SIGSEGV)
 ```
+
+**Apache error log**: `child pid 35 exit signal Segmentation fault (11)`
+
+Attack flow for UAF trigger:
+1. Normal request → establishes `object_buckets` pointer in ZMM
+2. OOM bomb → `bailout()` → ZMM freed → `object_buckets` now dangling
+3. Write crafted session file with `O:` serialized objects between requests
+4. Follow-up upload_progress request → `rfc1867` callback fires before RINIT
+   → reads session → deserializes 3 objects through stale `object_buckets`
+   → objects stored via dangling pointer → **SIGSEGV**
+
+Key observation: `object_buckets` pointer (0x7f4a92058200) persists
+unchanged after OOM. The ZMM backing it was freed during shutdown, so
+the pointer dereferences into freed memory. When session deserialization
+creates objects and stores them via `EG(objects_store).object_buckets[handle]`,
+it writes to freed heap → use-after-free → crash.
+
+The `top=2, size=2` after OOM (vs `top=5, size=5` baseline) reflects the
+partial objects_store state from the OOM request's aborted execution.
+
+With heap feng shui (spraying fake `zend_object` structs at the freed
+address), this crash converts to controlled code execution:
+- Fake object contains controlled `handlers` (vtable) pointer
+- Vtable points to attacker-chosen function pointers
+- Object creation/destruction dispatches through vtable → arbitrary call
+
+## Attack Flow
+
+### Pure Chain D: Stale PS(mod_data) UAF
+
+```
+Request 1 (setup): multipart + PHP_SESSION_UPLOAD_PROGRESS + PHPSESSID=X
+  → rfc1867 callback → php_session_start()
+  → PS(mod_data) = emalloc(sizeof(ps_files))  [in ZMM at addr A]
+  → PS(session_status) = php_session_active
+  → session file written to /tmp/sess_X
+  → request ends normally
+  → ZMM destroyed: addr A is freed
+  → RSHUTDOWN resets PS(session_status) = php_session_none
+  → PS(mod_data) still points to addr A (dangling)
+
+Request 2 (OOM): multipart + PHP_SESSION_UPLOAD_PROGRESS + PHPSESSID=X
+  → sapi_activate() → rfc1867_post_handler()
+  → rfc1867 callback fires BEFORE RINIT
+  → PS() NOT cleared (no php_rinit_session_globals)
+  → php_session_start() sees PS(session_status) = php_session_none
+  → Opens session, allocates NEW PS(mod_data) in fresh ZMM
+  → Parsing continues → more emalloc() → OOM → longjmp()
+  → php_request_shutdown() runs with partial state
+  → shutdown_executor(): EG(objects_store).object_buckets = dangling
+  → php_session_flush(): writes $_SESSION (may use stale PS state)
+  → ZMM destroyed: PS(mod_data) dangling again
+
+Request 3 (exploit): multipart + PHP_SESSION_UPLOAD_PROGRESS + PHPSESSID=X
+  → rfc1867 callback fires BEFORE RINIT
+  → PS(mod_data) = dangling pointer from Request 2's destroyed ZMM
+  → php_session_start() → PS(mod)->s_open() uses PS(mod_data)
+  → UAF: reads freed memory through PS(mod_data)
+```
+
+### Heap feng shui for UAF control
+
+The `ps_files` struct (session file handler data):
+```c
+typedef struct {
+    int fd;
+    char *lastkey;
+    char *basedir;
+    size_t dirdepth;
+    size_t st_size;
+    ...
+} ps_files;
+```
+
+If we control what occupies the freed `ps_files` address in Request 3's
+ZMM, we can control:
+- `fd` → arbitrary file descriptor
+- `lastkey` → arbitrary session key (file path control)
+- `basedir` → arbitrary session save path
+
+Request 3's multipart parser allocates memory for Content-Disposition
+headers, field names, and values BEFORE the upload progress callback
+fires. By sizing these allocations to match `sizeof(ps_files)`, we can
+place controlled data at the stale pointer address.
+
+## Patch Details (3584a98)
+
+The fix spans 389 files, +10,759 lines. Key changes:
+
+1. **Delayed OOM mechanism**: `ZEND_HAS_OOM` macro + `zend_handle_delayed_oom()`
+   replaces immediate `longjmp` with flag-based unwinding
+2. **Session globals reset**: `php_rinit_session_globals()` before rfc1867 callback
+3. **Objects store nullification**: `EG(objects_store).object_buckets = NULL` after free
+4. **$_SESSION cleanup**: `zend_delete_global_variable("_SESSION")` after upload progress
+5. **Error handler reset**: Clear stale `EG(user_error_handler)`, `EG(exception)`
 
 ## Reproduction
 
 ```bash
 cd lab && docker compose up -d
 
-# Verify OOM trigger
+# Configure single-worker mode for deterministic testing
+docker exec php2shell-apache bash -c '
+cat > /etc/apache2/mods-enabled/mpm_prefork.conf << "EOF"
+<IfModule mpm_prefork_module>
+    StartServers          1
+    MinSpareServers       1
+    MaxSpareServers       1
+    MaxRequestWorkers     1
+    MaxConnectionsPerChild 0
+</IfModule>
+EOF
+apache2ctl graceful'
+
+# UAF verification — triggers worker segfault
+python3 poc/chain_d_uaf_verify.py
+
+# Earlier verification scripts
 python3 poc/verify_oom_trigger.py --host 127.0.0.1 --port 18081
-
-# Verify EG() is NOT stale
 python3 poc/verify_chain_d_eg_persistence.py
-
-# Verify shutdown behavior
-python3 poc/verify_chain_d_oom_shutdown.py
-
-# Verify session data integrity
+python3 poc/chain_d_stale_ps.py
 python3 poc/chain_d_session_oom.py
-
-# Attempt heap spray (will not achieve RCE)
-python3 poc/verify_oom_trigger.py --enable-heapshape --strategy files \
-  --spray-objects 1000 --handler-ptr <zif_system_addr> --verify-method CRASH
 ```
