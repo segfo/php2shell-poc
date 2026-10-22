@@ -32,6 +32,7 @@ services:
       - ./php-apache.ini:/usr/local/etc/php/php.ini
     security_opt: [seccomp:unconfined]
     privileged: true
+    cap_add: [SYS_PTRACE]
     dns: [8.8.8.8, 8.8.4.4]
     command: >
       bash -c "mkdir -p /tmp/sessions && chmod 1777 /tmp/sessions && apache2-foreground"
