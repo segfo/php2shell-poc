@@ -186,7 +186,7 @@ cat > docker-compose.yml << 'YAML'
 services:
   # PHP-FPM (Chains A, B, C, E)
   php-fpm:
-    image: php:8.2-fpm
+    image: php:8.2.33-fpm
     container_name: php2shell-fpm
     volumes:
       - ./webroot:/var/www/html
@@ -209,7 +209,7 @@ services:
 
   # Apache mod_php (Chain D — OOM)
   apache:
-    image: php:8.2-apache
+    image: php:8.2.33-apache
     container_name: php2shell-apache
     ports: ["18081:80"]
     volumes:

@@ -1,8 +1,7 @@
 services:
-  # PHP-FPM — Chains A, B, C, E
-  # Single worker (pm.max_children=1) ensures producer/consumer hit same worker (Chain E)
+  # PHP-FPM (Chains A, B, C, E)
   php-fpm:
-    image: php:8.2-fpm
+    image: php:8.2.33-fpm
     container_name: php2shell-fpm
     volumes:
       - ./webroot:/var/www/html
@@ -23,10 +22,9 @@ services:
       - ./nginx.conf:/etc/nginx/conf.d/default.conf
     depends_on: [php-fpm]
 
-  # Apache mod_php — Chain D (OOM)
-  # Low memory_limit (32M) makes OOM easy to trigger
+  # Apache mod_php (Chain D — OOM)
   apache:
-    image: php:8.2-apache
+    image: php:8.2.33-apache
     container_name: php2shell-apache
     ports: ["18081:80"]
     volumes:

