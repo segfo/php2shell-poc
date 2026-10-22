@@ -103,6 +103,31 @@ session_start();
 echo "OK\n";
 PHP
 
+# RCE proof checker — used by Chain D+C exploit verification
+cat > webroot/check_rce.php << 'PHP'
+<?php
+$f = "/tmp/rce_proof.txt";
+echo file_exists($f) ? "RCE PROOF: " . file_get_contents($f) : "NOT FOUND";
+echo "\n";
+PHP
+
+# Session file inspector — used by exploit verification
+cat > webroot/check_sess.php << 'PHP'
+<?php
+$sid = $_GET["sid"] ?? "";
+if (!$sid) { echo "need ?sid=xxx"; exit; }
+$sp = session_save_path() ?: "/tmp";
+$path = "$sp/sess_$sid";
+if (file_exists($path)) {
+    $c = file_get_contents($path);
+    echo "SIZE: " . strlen($c) . "\n";
+    echo "CONTENT: " . $c . "\n";
+    echo "FORMAT: " . (substr($c, 0, 2) === "a:" ? "php_serialize" : (strpos($c, "|") !== false ? "php" : "unknown")) . "\n";
+} else {
+    echo "NOT FOUND\n";
+}
+PHP
+
 # ── PHP config (FPM) ────────────────────────────────────
 
 cat > php.ini << 'INI'
@@ -113,11 +138,12 @@ session.use_strict_mode = 0
 session.use_cookies = 1
 session.use_only_cookies = 0
 session.upload_progress.enabled = On
-session.upload_progress.cleanup = Off
+session.upload_progress.cleanup = 0
 session.upload_progress.prefix = upload_progress_
 session.upload_progress.name = PHP_SESSION_UPLOAD_PROGRESS
 session.upload_progress.freq = 1%
 session.upload_progress.min_freq = 0
+session.lazy_write = 0
 
 [PHP]
 display_errors = On
@@ -141,8 +167,13 @@ max_file_uploads = 100000
 display_errors = On
 error_reporting = E_ALL
 session.upload_progress.enabled = On
-session.upload_progress.cleanup = Off
+session.upload_progress.cleanup = 0
+session.upload_progress.prefix = upload_progress_
+session.upload_progress.name = PHP_SESSION_UPLOAD_PROGRESS
+session.upload_progress.freq = 1%
+session.upload_progress.min_freq = 0
 session.save_path = /tmp
+session.lazy_write = 0
 INI
 
 # ── Nginx config ────────────────────────────────────────
@@ -255,5 +286,6 @@ echo "║  Exploit:                                         ║"
 echo "║    cd ../exploit                                  ║"
 echo "║    python3 chain_a_session_lfi.py --port 18080     ║"
 echo "║    python3 chain_c_mismatch_rce.py --port 18080    ║"
+echo "║    python3 chain_d_oom_rce.py --port 18080         ║"
 echo "║                                                   ║"
 echo "╚═══════════════════════════════════════════════════╝"

